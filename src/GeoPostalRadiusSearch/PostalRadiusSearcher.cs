@@ -1,3 +1,4 @@
+using System.Data;
 using Microsoft.Data.SqlClient;
 
 namespace GeoPostalRadiusSearch;
@@ -8,28 +9,6 @@ public sealed record RadiusSearchResult(string PostalCode, double Latitude, doub
 
 public sealed class PostalRadiusSearcher(IConfiguration config)
 {
-    private const double MetersPerMile = 1609.344;
-    private const double MetersPerKm = 1000.0;
-
-    // STDistance(<constant>) <= <value> is the form that lets SQL Server use the spatial index.
-    private const string Sql = """
-        DECLARE @center geography = geography::Point(@lat, @lon, 4326);
-        SELECT pc.PostalCode, pt.Latitude, pt.Longitude, pt.Point.STDistance(@center) AS Meters
-        FROM Geo.PostalCodePoint AS pt WITH (NOLOCK)
-        INNER JOIN Geo.PostalCode AS pc WITH (NOLOCK) ON pc.PostalCodeID = pt.PostalCodeID
-        WHERE pt.Point.STDistance(@center) <= @radiusMeters
-          AND pc.CountryID = @countryId
-          AND pc.PostalCode <> @postalCode
-        ORDER BY Meters, pc.PostalCode;
-        """;
-
-    private const string LookupSql = """
-        SELECT TOP (1) pt.Latitude, pt.Longitude
-        FROM Geo.PostalCode AS pc WITH (NOLOCK)
-        INNER JOIN Geo.PostalCodePoint AS pt WITH (NOLOCK) ON pt.PostalCodeID = pc.PostalCodeID
-        WHERE pc.PostalCode = @postalCode AND pc.CountryID = @countryId;
-        """;
-
     private readonly string _connectionString = config.GetConnectionString("RatingGeography")
         ?? throw new InvalidOperationException("Missing ConnectionStrings:RatingGeography");
     private readonly int _usCountryId = config.GetValue("UsCountryId", 224);
@@ -39,28 +18,28 @@ public sealed class PostalRadiusSearcher(IConfiguration config)
         await using var conn = new SqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
-        double lat, lon;
-        await using (var lookup = new SqlCommand(LookupSql, conn))
-        {
-            lookup.Parameters.AddWithValue("@postalCode", postalCode);
-            lookup.Parameters.AddWithValue("@countryId", _usCountryId);
-            await using var r = await lookup.ExecuteReaderAsync(ct);
-            if (!await r.ReadAsync(ct)) return null;
-            lat = r.GetDouble(0);
-            lon = r.GetDouble(1);
-        }
+        await using var cmd = new SqlCommand("Geo.SearchPostalCodeByRadius", conn) { CommandType = CommandType.StoredProcedure };
+        cmd.Parameters.AddWithValue("@PostalCode", postalCode);
+        cmd.Parameters.AddWithValue("@CountryID", _usCountryId);
+        cmd.Parameters.AddWithValue("@Radius", radius);
+        cmd.Parameters.AddWithValue("@Unit", km ? "KM" : "MI");
+        cmd.Parameters.AddWithValue("@NTUser", "GeoRadius");
+        cmd.Parameters.AddWithValue("@System", "GeoPostalRadiusSearch");
+        cmd.Parameters.AddWithValue("@SessionKey", "");
+        cmd.Parameters.AddWithValue("@Token", "");
 
-        var unitMeters = km ? MetersPerKm : MetersPerMile;
-        var matches = new List<PostalMatch>();
-        await using var cmd = new SqlCommand(Sql, conn);
-        cmd.Parameters.AddWithValue("@postalCode", postalCode);
-        cmd.Parameters.AddWithValue("@countryId", _usCountryId);
-        cmd.Parameters.AddWithValue("@lat", lat);
-        cmd.Parameters.AddWithValue("@lon", lon);
-        cmd.Parameters.AddWithValue("@radiusMeters", radius * unitMeters);
         await using var rd = await cmd.ExecuteReaderAsync(ct);
+
+        // Result set 1: the center point (empty when the postal code has no point).
+        if (!await rd.ReadAsync(ct)) return null;
+        var lat = rd.GetDouble(0);
+        var lon = rd.GetDouble(1);
+
+        // Result set 2: matches, nearest first.
+        await rd.NextResultAsync(ct);
+        var matches = new List<PostalMatch>();
         while (await rd.ReadAsync(ct))
-            matches.Add(new PostalMatch(rd.GetString(0), rd.GetDouble(1), rd.GetDouble(2), Math.Round(rd.GetDouble(3) / unitMeters, 2)));
+            matches.Add(new PostalMatch(rd.GetString(1), rd.GetDouble(2), rd.GetDouble(3), rd.GetDouble(4)));
 
         return new RadiusSearchResult(postalCode, lat, lon, radius, km ? "km" : "mi", matches.Count, matches);
     }
