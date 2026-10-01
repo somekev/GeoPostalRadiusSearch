@@ -8,33 +8,25 @@ public sealed record RadiusSearchResult(string PostalCode, double Latitude, doub
 
 public sealed class PostalRadiusSearcher(IConfiguration config)
 {
-    private const double MilesPerDegreeLat = 69.0;
-    private const double KmPerDegreeLat = 111.32;
-    private const double EarthRadiusMiles = 3958.8;
-    private const double EarthRadiusKm = 6371.0;
+    private const double MetersPerMile = 1609.344;
+    private const double MetersPerKm = 1000.0;
 
-    // Bounding box on lat/long first (cheap), then exact great-circle distance on the survivors.
+    // STDistance(<constant>) <= <value> is the form that lets SQL Server use the spatial index.
     private const string Sql = """
-        SELECT pc.PostalCode, p.Latitude, p.Longitude, d.Distance
-        FROM Geo.PostalCode AS pc WITH (NOLOCK)
-        INNER JOIN Geo.PostalCodePosition AS p WITH (NOLOCK) ON p.PostalCodeID = pc.PostalCodeID
-        CROSS APPLY (
-            SELECT @earthRadius * ACOS(CASE WHEN x.v > 1 THEN 1 WHEN x.v < -1 THEN -1 ELSE x.v END) AS Distance
-            FROM (SELECT SIN(RADIANS(@lat)) * SIN(RADIANS(p.Latitude))
-                       + COS(RADIANS(@lat)) * COS(RADIANS(p.Latitude)) * COS(RADIANS(p.Longitude - @lon)) AS v) AS x
-        ) AS d
-        WHERE pc.CountryID = @countryId
+        DECLARE @center geography = geography::Point(@lat, @lon, 4326);
+        SELECT pc.PostalCode, pt.Latitude, pt.Longitude, pt.Point.STDistance(@center) AS Meters
+        FROM Geo.PostalCodePoint AS pt WITH (NOLOCK)
+        INNER JOIN Geo.PostalCode AS pc WITH (NOLOCK) ON pc.PostalCodeID = pt.PostalCodeID
+        WHERE pt.Point.STDistance(@center) <= @radiusMeters
+          AND pc.CountryID = @countryId
           AND pc.PostalCode <> @postalCode
-          AND p.Latitude  BETWEEN @lat - @dLat AND @lat + @dLat
-          AND p.Longitude BETWEEN @lon - @dLon AND @lon + @dLon
-          AND d.Distance <= @radius
-        ORDER BY d.Distance, pc.PostalCode;
+        ORDER BY Meters, pc.PostalCode;
         """;
 
     private const string LookupSql = """
-        SELECT TOP (1) p.Latitude, p.Longitude
+        SELECT TOP (1) pt.Latitude, pt.Longitude
         FROM Geo.PostalCode AS pc WITH (NOLOCK)
-        INNER JOIN Geo.PostalCodePosition AS p WITH (NOLOCK) ON p.PostalCodeID = pc.PostalCodeID
+        INNER JOIN Geo.PostalCodePoint AS pt WITH (NOLOCK) ON pt.PostalCodeID = pc.PostalCodeID
         WHERE pc.PostalCode = @postalCode AND pc.CountryID = @countryId;
         """;
 
@@ -58,24 +50,17 @@ public sealed class PostalRadiusSearcher(IConfiguration config)
             lon = r.GetDouble(1);
         }
 
-        var perDegreeLat = km ? KmPerDegreeLat : MilesPerDegreeLat;
-        var dLat = radius / perDegreeLat;
-        var cos = Math.Max(Math.Cos(lat * Math.PI / 180.0), 0.01);
-        var dLon = radius / (perDegreeLat * cos);
-
+        var unitMeters = km ? MetersPerKm : MetersPerMile;
         var matches = new List<PostalMatch>();
         await using var cmd = new SqlCommand(Sql, conn);
         cmd.Parameters.AddWithValue("@postalCode", postalCode);
         cmd.Parameters.AddWithValue("@countryId", _usCountryId);
         cmd.Parameters.AddWithValue("@lat", lat);
         cmd.Parameters.AddWithValue("@lon", lon);
-        cmd.Parameters.AddWithValue("@dLat", dLat);
-        cmd.Parameters.AddWithValue("@dLon", dLon);
-        cmd.Parameters.AddWithValue("@radius", radius);
-        cmd.Parameters.AddWithValue("@earthRadius", km ? EarthRadiusKm : EarthRadiusMiles);
+        cmd.Parameters.AddWithValue("@radiusMeters", radius * unitMeters);
         await using var rd = await cmd.ExecuteReaderAsync(ct);
         while (await rd.ReadAsync(ct))
-            matches.Add(new PostalMatch(rd.GetString(0), rd.GetDouble(1), rd.GetDouble(2), Math.Round(rd.GetDouble(3), 2)));
+            matches.Add(new PostalMatch(rd.GetString(0), rd.GetDouble(1), rd.GetDouble(2), Math.Round(rd.GetDouble(3) / unitMeters, 2)));
 
         return new RadiusSearchResult(postalCode, lat, lon, radius, km ? "km" : "mi", matches.Count, matches);
     }
