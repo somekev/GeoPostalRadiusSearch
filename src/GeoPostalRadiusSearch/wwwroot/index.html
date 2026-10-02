@@ -1,21 +1,35 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Postal Radius Search</title>
-<style>body{font-family:Segoe UI,sans-serif;margin:2rem;max-width:760px}input,select,button{padding:.4rem;margin-right:.4rem}
+<html lang="en"><head><meta charset="utf-8"><title>Geo Radius Search</title>
+<style>body{font-family:Segoe UI,sans-serif;margin:2rem;max-width:860px}input,select,button{padding:.4rem;margin:.2rem .4rem .2rem 0}
 table{border-collapse:collapse;margin-top:1rem;width:100%}td,th{border-bottom:1px solid #ddd;padding:.3rem .5rem;text-align:left}.err{color:#b00}</style></head>
-<body><h2>US Postal Code Radius Search (DEV)</h2>
-<form id="f"><input id="pc" placeholder="Postal code" maxlength="5" value="55344" required>
+<body><h2>Geo Radius Search (DEV)</h2>
+<form id="f">
+<select id="kind"><option value="postalcodes">Postal codes</option><option value="cities">Cities</option><option value="postalgroups">Postal groups</option></select>
+<input id="lat" type="number" step="any" min="-90" max="90" value="44.823993" placeholder="Latitude" required>
+<input id="lon" type="number" step="any" min="-180" max="180" value="-93.343223" placeholder="Longitude" required>
 <input id="r" type="number" min="1" max="1000" step="any" value="10" required>
-<select id="u"><option value="mi">miles</option><option value="km">km</option></select><button>Search</button></form>
+<select id="u"><option value="mi">miles</option><option value="km">km</option></select>
+<input id="ids" value="224" size="14" title="Country IDs (postal codes, cities) or postal group type IDs (postal groups), comma separated" required>
+<button>Search</button></form>
+<small>IDs = country IDs for postal codes / cities (224 = US, 37, 149 have postal data), postal group type IDs for postal groups (3 = CA 3 digit).</small>
 <div id="out"></div>
 <script>
+const idParam = { postalcodes: 'countryIds', cities: 'countryIds', postalgroups: 'postalGroupTypeIds' };
+const cols = {
+  postalcodes: [['postalCode','Postal code'],['countryId','Country'],['distance','Distance'],['latitude','Lat'],['longitude','Long']],
+  cities: [['cityId','City ID'],['countryId','Country'],['distance','Distance'],['latitude','Lat'],['longitude','Long']],
+  postalgroups: [['name','Name'],['postalGroupTypeId','Type'],['distance','Distance'],['latitude','Lat'],['longitude','Long']]
+};
 document.getElementById('f').onsubmit = async e => {
   e.preventDefault();
   const out = document.getElementById('out'); out.textContent = 'Searching...';
-  const q = new URLSearchParams({postalCode: pc.value, radius: r.value, unit: u.value});
-  const res = await fetch('/api/postalcodes/radius?' + q); const j = await res.json();
+  const k = kind.value;
+  const q = new URLSearchParams({lat: lat.value, lon: lon.value, radius: r.value, unit: u.value, [idParam[k]]: ids.value});
+  const res = await fetch(`/api/${k}/radius?` + q); const j = await res.json();
   if (!res.ok) { out.innerHTML = '<p class="err">' + (j.error || j.detail || res.status) + '</p>'; return; }
-  out.innerHTML = `<p>${j.count} postal codes within ${j.radius} ${j.unit} of ${j.postalCode} (${j.latitude}, ${j.longitude})</p>
-  <table><tr><th>Postal code</th><th>Distance (${j.unit})</th><th>Lat</th><th>Long</th></tr>` +
-  j.matches.map(m => `<tr><td>${m.postalCode}</td><td>${m.distance}</td><td>${m.latitude}</td><td>${m.longitude}</td></tr>`).join('') + '</table>';
+  const shown = j.matches.slice(0, 500);
+  out.innerHTML = `<p>${j.count} results within ${j.radius} ${j.unit} of (${j.latitude}, ${j.longitude})${j.count > shown.length ? ` - showing first ${shown.length}` : ''}</p>
+  <table><tr>${cols[k].map(c => `<th>${c[1]}</th>`).join('')}</tr>` +
+  shown.map(m => `<tr>${cols[k].map(c => `<td>${m[c[0]]}</td>`).join('')}</tr>`).join('') + '</table>';
 };
 </script></body></html>
